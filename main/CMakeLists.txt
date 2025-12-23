@@ -1,3 +1,3 @@
-idf_component_register(SRCS "main.c"
+idf_component_register(SRCS "driver.c" "mqtt.c" "main.c"
           #PRIV_REQUIRES esp_driver_mcpwm
                     INCLUDE_DIRS ".")
