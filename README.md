@@ -1,4 +1,4 @@
-# ESP32 Inverter – Home Assistant Integration via MQTT
+# ESPWM-32 - ESP32 Inverter
 
 ![MCU](https://img.shields.io/badge/MCU-ESP32-blue)
 ![Framework](https://img.shields.io/badge/Framework-ESP--IDF_5.4.x-green)
