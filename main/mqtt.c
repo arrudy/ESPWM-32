@@ -113,10 +113,10 @@ void handle_state(const char* data, int len) {
     //placeholder
     if (strncmp(data, "ON", len) == 0) {
         ESP_LOGI(TAG, "Inverter -> ON");
-        request_new_frequency(DEFAULT_FREQ_HZ);
+        spwm_start(DEFAULT_FREQ_HZ);
     } else {
         ESP_LOGI(TAG, "Inverter -> OFF");
-        request_new_frequency(0);
+        spwm_stop();
     }
 }
 
@@ -137,7 +137,7 @@ void handle_frequency(const char* data, int len) {
 
     ESP_LOGI(TAG, "Frequency request of %ld Hz", freq);
 
-    request_new_frequency((int)freq);
+    spwm_set_target_frequency((int)freq);
 }
 
 

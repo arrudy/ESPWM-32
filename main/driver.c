@@ -69,14 +69,14 @@ typedef struct {
     volatile int samples;
 } spwm_internal_state_t;
 
-static spwm_internal_state_t active_state = {
+static volatile spwm_internal_state_t active_state = {
   .enabled = false,  //tied to ISR update, requested from thread
   .current_freq = 0, //tied to LUT update, requested from thread
   .mod_index = 0.95, //tied to LUT update, requested from thread
   .samples = 0
 };
 
-static spwm_internal_state_t pending_state = {
+static volatile spwm_internal_state_t pending_state = {
   .enabled = false,  //tied to ISR update, requested from thread
   .current_freq = 0, //tied to LUT update, requested from thread
   .mod_index = 0.95, //tied to LUT update, requested from thread
@@ -90,7 +90,8 @@ static volatile bool g_update_pending = false;
 static volatile int g_current_sample_idx = 0;
 
 
-mcpwm_cmpr_handle_t comparator = NULL;
+mcpwm_cmpr_handle_t comparator_leg1 = NULL;
+mcpwm_cmpr_handle_t comparator_leg2 = NULL;
 
 mcpwm_gen_handle_t gen_leg1_h = NULL;
 mcpwm_gen_handle_t gen_leg1_l = NULL;
@@ -237,12 +238,8 @@ static bool IRAM_ATTR mcpwm_timer_event_cb(mcpwm_timer_handle_t timer, const mcp
 
         if(active_state.enabled == false)
         {
-            //ESP_ERROR_CHECK(mcpwm_timer_start_stop(timer, MCPWM_TIMER_STOP_EMPTY));//implement in 2 spots a the same time
-            mcpwm_generator_set_force_level(gen_leg1_h, 0, true);
-            mcpwm_generator_set_force_level(gen_leg1_l, 0, true);
-            mcpwm_generator_set_force_level(gen_leg2_h, 0, true);
-            mcpwm_generator_set_force_level(gen_leg2_l, 0, true);
-            
+            mcpwm_comparator_set_compare_value(comparator_leg1, 0);
+            mcpwm_comparator_set_compare_value(comparator_leg2, 0);
             return false; 
         }
 
@@ -253,7 +250,7 @@ static bool IRAM_ATTR mcpwm_timer_event_cb(mcpwm_timer_handle_t timer, const mcp
     // 2. Update HF SPWM (Leg 1)
     uint32_t cmp_val = active_lut[g_current_sample_idx];
     if (cmp_val > MAX_TICKS) cmp_val = MAX_TICKS; // Safety Clamp
-    mcpwm_comparator_set_compare_value(comparator, cmp_val);
+    mcpwm_comparator_set_compare_value(comparator_leg1, cmp_val);
 
 
     // 3. Update LF Commutation (Leg 2) via Hardware Force
@@ -263,11 +260,11 @@ static bool IRAM_ATTR mcpwm_timer_event_cb(mcpwm_timer_handle_t timer, const mcp
     if (g_current_sample_idx == 0) {
         // First Half: Leg 2 High=ON, Leg 2 Low=OFF
         // (Force Level handles overrides; Deadtime module handles safety)
-        mcpwm_generator_set_force_level(gen_leg2_h, 1, true); // Hold High
+        mcpwm_comparator_set_compare_value(comparator_leg2, PEAK_TICKS );  // Hold High; unsafe, critical fix required
     } 
     else if (g_current_sample_idx == half_cycle) {
         // Second Half: Leg 2 High=OFF, Leg 2 Low=ON
-        mcpwm_generator_set_force_level(gen_leg2_h, 0, true); // Hold Low
+        mcpwm_comparator_set_compare_value(comparator_leg2, 0); // Hold Low
     }
 
     g_current_sample_idx++;
@@ -330,8 +327,12 @@ void setup_mcpwm()
     mcpwm_comparator_config_t comparator_config = {
         .flags.update_cmp_on_tez = true, 
     };
-    ESP_ERROR_CHECK(mcpwm_new_comparator(oper_leg1, &comparator_config, &comparator));
-    ESP_ERROR_CHECK(mcpwm_comparator_set_compare_value(comparator, 0));
+    ESP_ERROR_CHECK(mcpwm_new_comparator(oper_leg1, &comparator_config, &comparator_leg1));
+    ESP_ERROR_CHECK(mcpwm_comparator_set_compare_value(comparator_leg1, 0));
+
+    // Leg 2 Comparator (NEW: Required for safe ISR control)
+    ESP_ERROR_CHECK(mcpwm_new_comparator(oper_leg2, &comparator_config, &comparator_leg2));
+    ESP_ERROR_CHECK(mcpwm_comparator_set_compare_value(comparator_leg2, 0));
 
     // -------------------------------------------------------
     // 4. Generator Setup
@@ -358,14 +359,23 @@ void setup_mcpwm()
     // -------------------------------------------------------
     ESP_ERROR_CHECK(mcpwm_generator_set_actions_on_compare_event(
         gen_leg1_h, 
-        MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, comparator, MCPWM_GEN_ACTION_HIGH),
-        MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_DOWN, comparator, MCPWM_GEN_ACTION_LOW),
+        MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, comparator_leg1, MCPWM_GEN_ACTION_LOW),
+        MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_DOWN, comparator_leg1, MCPWM_GEN_ACTION_HIGH),
         MCPWM_GEN_COMPARE_EVENT_ACTION_END()
     ));
     ESP_ERROR_CHECK(mcpwm_generator_set_actions_on_timer_event(gen_leg1_h,
-        MCPWM_GEN_TIMER_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, MCPWM_TIMER_EVENT_EMPTY, MCPWM_GEN_ACTION_LOW),
+        MCPWM_GEN_TIMER_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, MCPWM_TIMER_EVENT_EMPTY, MCPWM_GEN_ACTION_HIGH),
         MCPWM_GEN_TIMER_EVENT_ACTION_END()
     ));
+
+    ESP_ERROR_CHECK(mcpwm_generator_set_actions_on_compare_event(gen_leg2_h, 
+        MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, comparator_leg2, MCPWM_GEN_ACTION_LOW),
+        MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_DOWN, comparator_leg2, MCPWM_GEN_ACTION_HIGH),
+        MCPWM_GEN_COMPARE_EVENT_ACTION_END()));
+    ESP_ERROR_CHECK(mcpwm_generator_set_actions_on_timer_event(gen_leg2_h,
+        MCPWM_GEN_TIMER_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, MCPWM_TIMER_EVENT_EMPTY, MCPWM_GEN_ACTION_HIGH),
+        MCPWM_GEN_TIMER_EVENT_ACTION_END()));
+
 
     
 
@@ -404,10 +414,10 @@ void setup_mcpwm()
     ESP_ERROR_CHECK(mcpwm_timer_enable(timer));
     ESP_ERROR_CHECK(mcpwm_timer_start_stop(timer, MCPWM_TIMER_START_NO_STOP));
 
-    mcpwm_generator_set_force_level(gen_leg1_h, 0, true);
-    mcpwm_generator_set_force_level(gen_leg1_l, 0, true);
-    mcpwm_generator_set_force_level(gen_leg2_h, 0, true);
-    mcpwm_generator_set_force_level(gen_leg2_l, 0, true);
+    //mcpwm_generator_set_force_level(gen_leg1_h, 0, true);
+    //mcpwm_generator_set_force_level(gen_leg1_l, 0, true);
+    //mcpwm_generator_set_force_level(gen_leg2_h, 0, true);
+    //mcpwm_generator_set_force_level(gen_leg2_l, 0, true);
     
     xTaskCreate(freq_update_task, "freq_task", 4096, NULL, 5, NULL);
 }
@@ -447,11 +457,9 @@ void spwm_start(int frequency)
         g_update_pending = false; 
 
         taskEXIT_CRITICAL(&spwm_lock);
+
+        spwm_set_target_frequency(frequency);
         
-        // Now ramp to target if different from start freq
-        if (frequency != 50) {
-            spwm_set_target_frequency(frequency);
-        }
         return;
     }
 
