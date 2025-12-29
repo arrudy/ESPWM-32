@@ -11,12 +11,12 @@
 
 
 
-void set_new_frequency(int freq_hz);
-void force_new_frequency(void);
+
 void setup_mcpwm();
 
-void request_new_frequency(int new_target);
+void spwm_start(int frequency);
+void spwm_stop(void);
+void spwm_set_target_frequency(int frequency);
 
-//void freq_update_task(void *pvParameters);
 
 #endif

@@ -19,9 +19,12 @@ static const char *TAG = "MAIN";
 
 void app_main(void)
 {
-    set_new_frequency(DEFAULT_FREQ_HZ);
-    force_new_frequency();
+    //set_new_frequency(DEFAULT_FREQ_HZ);
+    //force_new_frequency();
     setup_mcpwm();
+    //request_new_frequency(DEFAULT_FREQ_HZ);
+    spwm_start(DEFAULT_FREQ_HZ);
+    
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {

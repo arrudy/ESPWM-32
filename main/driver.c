@@ -60,12 +60,35 @@ static DRAM_ATTR uint32_t sine_lut[2][MAX_SAMPLES];
 static volatile uint32_t * volatile active_lut = sine_lut[0];
 static volatile uint32_t * volatile pending_lut = sine_lut[1];
 
-static volatile int g_current_sample_idx = 0;
-static volatile int g_samples_per_cycle = 0;
-static volatile int g_pending_samples = 0;
-static volatile bool g_update_pending = false;
+static SemaphoreHandle_t lut_calc_mutex = NULL;
 
-static volatile bool g_enabled = false;
+typedef struct {
+    volatile bool enabled;
+    volatile int current_freq;
+    volatile float mod_index;
+    volatile int samples;
+} spwm_internal_state_t;
+
+static spwm_internal_state_t active_state = {
+  .enabled = false,  //tied to ISR update, requested from thread
+  .current_freq = 0, //tied to LUT update, requested from thread
+  .mod_index = 0.95, //tied to LUT update, requested from thread
+  .samples = 0
+};
+
+static spwm_internal_state_t pending_state = {
+  .enabled = false,  //tied to ISR update, requested from thread
+  .current_freq = 0, //tied to LUT update, requested from thread
+  .mod_index = 0.95, //tied to LUT update, requested from thread
+  .samples = 0
+};
+
+
+static volatile int target_freq = 0;
+static volatile bool g_update_pending = false;  
+
+static volatile int g_current_sample_idx = 0;
+
 
 mcpwm_cmpr_handle_t comparator = NULL;
 
@@ -78,13 +101,44 @@ mcpwm_timer_handle_t timer = NULL;
 
 
 
-
+static inline __attribute__((always_inline)) void swap_lut_pointers(volatile uint32_t * volatile *a, volatile uint32_t * volatile *b)
+{
+    volatile uint32_t *temp = *a;
+    *a = *b;
+    *b = temp;
+}
 
 
 #define DEFAULT_FREQ_STEP 2 //for smooth changes in the frequency
 
-static volatile int target_freq = DEFAULT_FREQ_HZ;
-static volatile int current_freq = DEFAULT_FREQ_HZ;
+
+
+static portMUX_TYPE spwm_lock = portMUX_INITIALIZER_UNLOCKED;
+//metadata about the SPWM module
+typedef struct
+{
+    bool running;
+    int current_frequency;
+    int target_frequency;
+    float mod_index;
+    bool fuzzy_en;
+    bool silent;
+    bool update_pending;
+} spwm_runtime_state_t;
+
+
+void spwm_get_state(spwm_runtime_state_t *out)
+{
+    taskENTER_CRITICAL(&spwm_lock);
+    out->running              = active_state.enabled;
+    out->current_frequency    = active_state.current_freq;
+    out->target_frequency     = target_freq;
+    out->mod_index            = active_state.mod_index;
+    out->fuzzy_en             = false;
+    out->silent               = false;
+    out->update_pending       = g_update_pending;
+    taskEXIT_CRITICAL(&spwm_lock);
+}
 
 
 
@@ -97,6 +151,8 @@ static void freq_update_task(void *);
 
 void set_new_frequency(int new_freq)
 {
+    xSemaphoreTake(lut_calc_mutex, portMAX_DELAY);
+
     float freq_hz = new_freq;
 
 
@@ -109,7 +165,7 @@ void set_new_frequency(int new_freq)
     // Ensure we never exceed 100% duty cycle
     if (v_f_ratio > 1.0f) v_f_ratio = 1.0f;
 
-    const float current_mod_index = v_f_ratio;
+    
 
 
     int samples = (int)(CARRIER_FREQ_HZ / freq_hz);
@@ -123,7 +179,7 @@ void set_new_frequency(int new_freq)
         float sin_val = fabsf(sin(angle));
         
         // Calculate
-        uint32_t duty_ticks = (uint32_t)(PEAK_TICKS * sin_val * current_mod_index);
+        uint32_t duty_ticks = (uint32_t)(PEAK_TICKS * sin_val * v_f_ratio);
         
         // PRE-CALCULATION CLAMP
         if (duty_ticks > MAX_TICKS) {
@@ -137,18 +193,22 @@ void set_new_frequency(int new_freq)
              samples, 
              (1000000.0 / CARRIER_FREQ_HZ));
 
-    current_freq = new_freq;
-    g_pending_samples = samples;
+    taskENTER_CRITICAL(&spwm_lock);
+    pending_state.mod_index = v_f_ratio;
+    pending_state.current_freq = new_freq;
+    pending_state.samples = samples;
     g_update_pending = true; 
+    taskEXIT_CRITICAL(&spwm_lock);
+    xSemaphoreGive(lut_calc_mutex);
 }
 
 
 void force_new_frequency(void)
 {
-    active_lut = sine_lut[1];
-    pending_lut = sine_lut[0];
-    g_samples_per_cycle = g_pending_samples;
-    g_update_pending = false;
+    swap_lut_pointers(&active_lut, &pending_lut);
+    //g_samples_per_cycle = pending_state.samples;
+    active_state = pending_state;
+    g_update_pending = false;    
 }
 
 
@@ -158,31 +218,36 @@ void force_new_frequency(void)
 // ----------------------------------------------------------------------------------
 static bool IRAM_ATTR mcpwm_timer_event_cb(mcpwm_timer_handle_t timer, const mcpwm_timer_event_data_t *edata, void *user_ctx)
 {
-    if (g_samples_per_cycle == 0) return false;
+    if (active_state.samples == 0) return false;
 
     // 1. Cycle End Check & LUT Swap
-    if (g_current_sample_idx >= g_samples_per_cycle) {
+    if (g_current_sample_idx >= active_state.samples) {
         g_current_sample_idx = 0;
 
 
-        if(g_enabled == false)
+        if (g_update_pending) {
+
+            swap_lut_pointers(&active_lut, &pending_lut);
+            //g_samples_per_cycle = g_pending_samples;
+            active_state = pending_state;
+            g_update_pending = false;
+        }
+        
+
+
+        if(active_state.enabled == false)
         {
+            //ESP_ERROR_CHECK(mcpwm_timer_start_stop(timer, MCPWM_TIMER_STOP_EMPTY));//implement in 2 spots a the same time
             mcpwm_generator_set_force_level(gen_leg1_h, 0, true);
             mcpwm_generator_set_force_level(gen_leg1_l, 0, true);
             mcpwm_generator_set_force_level(gen_leg2_h, 0, true);
             mcpwm_generator_set_force_level(gen_leg2_l, 0, true);
-
+            
             return false; 
         }
 
 
-        if (g_update_pending) {
-            uint32_t *temp = active_lut;
-            active_lut = pending_lut;
-            pending_lut = temp; 
-            g_samples_per_cycle = g_pending_samples;
-            g_update_pending = false;
-        }
+        
     }
 
     // 2. Update HF SPWM (Leg 1)
@@ -193,7 +258,7 @@ static bool IRAM_ATTR mcpwm_timer_event_cb(mcpwm_timer_handle_t timer, const mcp
 
     // 3. Update LF Commutation (Leg 2) via Hardware Force
     // We only issue the command twice per cycle to save overhead
-    int half_cycle = g_samples_per_cycle / 2;
+    int half_cycle = active_state.samples / 2;
 
     if (g_current_sample_idx == 0) {
         // First Half: Leg 2 High=ON, Leg 2 Low=OFF
@@ -226,6 +291,8 @@ void setup_mcpwm()
         gpio_set_direction(pins[i], GPIO_MODE_DISABLE);
     
     }
+
+    lut_calc_mutex = xSemaphoreCreateMutex();
     
 
     // -------------------------------------------------------
@@ -341,6 +408,7 @@ void setup_mcpwm()
     mcpwm_generator_set_force_level(gen_leg1_l, 0, true);
     mcpwm_generator_set_force_level(gen_leg2_h, 0, true);
     mcpwm_generator_set_force_level(gen_leg2_l, 0, true);
+    
     xTaskCreate(freq_update_task, "freq_task", 4096, NULL, 5, NULL);
 }
 
@@ -348,49 +416,98 @@ void setup_mcpwm()
 
 
 
-
-void request_new_frequency(int new_target)
+//think about snapshoting the active & pending states before logic operations
+void spwm_start(int frequency)
 {
-    if(new_target <= 0) //stopping
-    {
-        g_enabled = false;
-        target_freq = 0;
-        current_freq = 0;    // Reset current so ramping task stops immediately
-        ESP_LOGW(TAG, "Inverter STOP requested (Will halt at next zero-cross)");
-        return;
-    }
 
-    if (!g_enabled || current_freq == 0) 
-    {
-        ESP_LOGI(TAG, "Inverter STARTING. Forcing initial 50Hz.");
+    
+    // 1. Check if we are fully stopped
+    if (!active_state.enabled) {
+        // Standard Cold Start logic
+        ESP_LOGI(TAG, "Inverter STARTING.");
         
 
-
-        // 2. Setup frequency to exactly 50Hz immediately
-        int start_f = 50; 
-        set_new_frequency(start_f); 
-        force_new_frequency();
-        current_freq = start_f;
-        target_freq = new_target;
-
-        // 1. Prepare the hardware (Remove safety forces)
+        set_new_frequency(50); // Calc 50Hz LUT
+        taskENTER_CRITICAL(&spwm_lock);
+        // Reset to safe defaults
+        
+        pending_state.enabled = true;
+        
+        // Safe Initial Swap (since hardware is off, no glitches possible)
+        swap_lut_pointers(&active_lut, &pending_lut);
+        
+        active_state = pending_state;
+        
+        // Un-force the pins (The ISR is likely running but doing nothing)
         mcpwm_generator_set_force_level(gen_leg1_h, -1, true); 
         mcpwm_generator_set_force_level(gen_leg1_l, -1, true);
         mcpwm_generator_set_force_level(gen_leg2_h, -1, true);
         mcpwm_generator_set_force_level(gen_leg2_l, -1, true);
+
+        g_update_pending = false; 
+
+        taskEXIT_CRITICAL(&spwm_lock);
         
-        // 3. Enable the ISR logic
-        g_enabled = true;
-    } 
-    else{ //already running
-
-    new_target = new_target < MAX_FREQ_HZ ? new_target : MAX_FREQ_HZ;
-    new_target = new_target > MIN_FREQ_HZ ? new_target : MIN_FREQ_HZ;
-
-    target_freq = new_target;
+        // Now ramp to target if different from start freq
+        if (frequency != 50) {
+            spwm_set_target_frequency(frequency);
+        }
+        return;
     }
 
+    // 2. Check if we are in the "Stopping" state (The Zombie State)
+    // active is TRUE, but pending is FALSE.
+    if (g_update_pending && !pending_state.enabled) {
+        ESP_LOGI(TAG, "Inverter Stop ABORTED. Resuming operation.");
+        
+        set_new_frequency(frequency);
+        taskENTER_CRITICAL(&spwm_lock);
+        pending_state.enabled = true; // Cancel the stop
+        
+        // Optionally apply new frequency immediately if requested
+        
+        g_update_pending = true; // Ensure ISR picks up the "True" enabled state
+        taskEXIT_CRITICAL(&spwm_lock);
+        
+        target_freq = frequency;
+        return;
+    }
 
+    // 3. Otherwise, we are just running normally
+    ESP_LOGW(TAG, "Inverter start requested while already running.");
+}
+
+
+
+
+void spwm_stop(void)
+{
+    target_freq = 0;
+    taskENTER_CRITICAL(&spwm_lock);
+    pending_state.enabled = false;
+    pending_state.current_freq = 0;
+    g_update_pending = true;
+    taskEXIT_CRITICAL(&spwm_lock);
+    ESP_LOGW(TAG, "Inverter STOP requested (Will halt at next zero-cross)");
+    
+    return;
+}
+
+
+
+
+void spwm_set_target_frequency(int frequency)
+{
+    if(!active_state.enabled)
+    {
+        ESP_LOGW(TAG, "Inverter FREQ_CHNG requested while not running. Starting.");
+        spwm_start(frequency);
+        return;
+    }
+
+    frequency = frequency < MAX_FREQ_HZ ? frequency : MAX_FREQ_HZ;
+    frequency = frequency > MIN_FREQ_HZ ? frequency : MIN_FREQ_HZ;
+    target_freq = frequency;
 }
 
 
@@ -399,9 +516,13 @@ static void freq_update_task(void *pvParameters)
 {
     vTaskDelay(pdMS_TO_TICKS(500)); 
     while (1) {
-        if(g_enabled && current_freq > 0 && target_freq != current_freq)
+        if(
+            active_state.enabled && 
+            !g_update_pending && //no update requests so far, we are the only ones staging an update
+//            pending_state.current_freq > 0 && 
+            target_freq != active_state.current_freq)
         {
-            int diff = (target_freq  - current_freq );
+            int diff = (target_freq  - active_state.current_freq );
 
             int calc_freq = DEFAULT_FREQ_HZ;
 
@@ -412,7 +533,7 @@ static void freq_update_task(void *pvParameters)
             else
             {
                 int sign = diff > 0 ? 1 : -1;
-                calc_freq = current_freq + sign*DEFAULT_FREQ_STEP;
+                calc_freq = active_state.current_freq + sign*DEFAULT_FREQ_STEP;
             }
 
             set_new_frequency(calc_freq);
