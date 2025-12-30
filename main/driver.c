@@ -7,8 +7,6 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include "driver/gpio.h"
 #include "driver/mcpwm_prelude.h"
 #include "esp_log.h"
@@ -62,6 +60,8 @@ static volatile uint32_t * volatile pending_lut = sine_lut[1];
 
 static SemaphoreHandle_t lut_calc_mutex = NULL;
 
+
+
 typedef struct {
     volatile bool enabled;
     volatile int current_freq;
@@ -72,22 +72,26 @@ typedef struct {
 static volatile spwm_internal_state_t active_state = {
   .enabled = false,  //tied to ISR update, requested from thread
   .current_freq = 0, //tied to LUT update, requested from thread
-  .mod_index = 0.95, //tied to LUT update, requested from thread
+  .mod_index = 0.f, //tied to LUT update, requested from thread
   .samples = 0
 };
 
 static volatile spwm_internal_state_t pending_state = {
   .enabled = false,  //tied to ISR update, requested from thread
   .current_freq = 0, //tied to LUT update, requested from thread
-  .mod_index = 0.95, //tied to LUT update, requested from thread
+  .mod_index = 0.f, //tied to LUT update, requested from thread
   .samples = 0
 };
+
 
 
 static volatile int target_freq = 0;
 static volatile bool g_update_pending = false;  
 
 static volatile int g_current_sample_idx = 0;
+
+static EventGroupHandle_t mqtt_dirty_flags = NULL;
+static TaskHandle_t mqtt_task_handle = NULL;
 
 
 mcpwm_cmpr_handle_t comparator_leg1 = NULL;
@@ -116,16 +120,7 @@ static inline __attribute__((always_inline)) void swap_lut_pointers(volatile uin
 
 static portMUX_TYPE spwm_lock = portMUX_INITIALIZER_UNLOCKED;
 //metadata about the SPWM module
-typedef struct
-{
-    bool running;
-    int current_frequency;
-    int target_frequency;
-    float mod_index;
-    bool fuzzy_en;
-    bool silent;
-    bool update_pending;
-} spwm_runtime_state_t;
+
 
 
 void spwm_get_state(spwm_runtime_state_t *out)
@@ -195,12 +190,24 @@ void set_new_frequency(int new_freq)
              (1000000.0 / CARRIER_FREQ_HZ));
 
     taskENTER_CRITICAL(&spwm_lock);
+
+    bool changed = false;
+
+    if(pending_state.mod_index != v_f_ratio || pending_state.current_freq != new_freq) changed = true;
+
+    if(pending_state.mod_index != v_f_ratio) 
+        xEventGroupSetBits(mqtt_dirty_flags, MQTT_UPDATE_MOD_INDEX_BIT); //may not change, when freq does
     pending_state.mod_index = v_f_ratio;
+    if(pending_state.current_freq != new_freq) 
+        xEventGroupSetBits(mqtt_dirty_flags, MQTT_UPDATE_FREQ_BIT); //not fully bulletproof, but reduces traffic
     pending_state.current_freq = new_freq;
+
+
     pending_state.samples = samples;
     g_update_pending = true; 
     taskEXIT_CRITICAL(&spwm_lock);
     xSemaphoreGive(lut_calc_mutex);
+
 }
 
 
@@ -231,6 +238,19 @@ static bool IRAM_ATTR mcpwm_timer_event_cb(mcpwm_timer_handle_t timer, const mcp
             swap_lut_pointers(&active_lut, &pending_lut);
             //g_samples_per_cycle = g_pending_samples;
             active_state = pending_state;
+
+            if (mqtt_task_handle != NULL) {
+                BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+                
+                // eSetBits: Works exactly like EventGroup (OR logic)
+                xTaskNotifyFromISR(mqtt_task_handle, 
+                                   NOTIFY_SOURCE_DRIVER, 
+                                   eSetBits, 
+                                   &xHigherPriorityTaskWoken);
+                
+                portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+            }
+
             g_update_pending = false;
         }
         
@@ -290,6 +310,7 @@ void setup_mcpwm()
     }
 
     lut_calc_mutex = xSemaphoreCreateMutex();
+    mqtt_dirty_flags = xEventGroupCreate();
     
 
     // -------------------------------------------------------
@@ -414,16 +435,19 @@ void setup_mcpwm()
     ESP_ERROR_CHECK(mcpwm_timer_enable(timer));
     ESP_ERROR_CHECK(mcpwm_timer_start_stop(timer, MCPWM_TIMER_START_NO_STOP));
 
-    //mcpwm_generator_set_force_level(gen_leg1_h, 0, true);
-    //mcpwm_generator_set_force_level(gen_leg1_l, 0, true);
-    //mcpwm_generator_set_force_level(gen_leg2_h, 0, true);
-    //mcpwm_generator_set_force_level(gen_leg2_l, 0, true);
+    mcpwm_generator_set_force_level(gen_leg1_h, 0, true);
+    mcpwm_generator_set_force_level(gen_leg1_l, 0, true);
+    mcpwm_generator_set_force_level(gen_leg2_h, 0, true);
+    mcpwm_generator_set_force_level(gen_leg2_l, 0, true);
     
     xTaskCreate(freq_update_task, "freq_task", 4096, NULL, 5, NULL);
 }
 
 
-
+void spwm_register_mqtt(TaskHandle_t handle)
+{
+    mqtt_task_handle = handle;
+}
 
 
 //think about snapshoting the active & pending states before logic operations
@@ -438,6 +462,7 @@ void spwm_start(int frequency)
         
 
         set_new_frequency(50); // Calc 50Hz LUT
+
         taskENTER_CRITICAL(&spwm_lock);
         // Reset to safe defaults
         
@@ -459,6 +484,10 @@ void spwm_start(int frequency)
         taskEXIT_CRITICAL(&spwm_lock);
 
         spwm_set_target_frequency(frequency);
+
+        if (mqtt_task_handle) {
+            xTaskNotify(mqtt_task_handle, NOTIFY_SOURCE_DRIVER, eSetBits);
+        }
         
         return;
     }
@@ -494,10 +523,17 @@ void spwm_stop(void)
     taskENTER_CRITICAL(&spwm_lock);
     pending_state.enabled = false;
     pending_state.current_freq = 0;
+    pending_state.mod_index = 0.0f;
     g_update_pending = true;
     taskEXIT_CRITICAL(&spwm_lock);
     ESP_LOGW(TAG, "Inverter STOP requested (Will halt at next zero-cross)");
-    
+
+    if (mqtt_dirty_flags) 
+    {
+        xEventGroupSetBits(mqtt_dirty_flags, MQTT_UPDATE_STATUS_BIT);
+        xEventGroupSetBits(mqtt_dirty_flags, MQTT_UPDATE_FREQ_BIT);
+        xEventGroupSetBits(mqtt_dirty_flags, MQTT_UPDATE_MOD_INDEX_BIT);
+    }
     return;
 }
 
@@ -515,7 +551,9 @@ void spwm_set_target_frequency(int frequency)
 
     frequency = frequency < MAX_FREQ_HZ ? frequency : MAX_FREQ_HZ;
     frequency = frequency > MIN_FREQ_HZ ? frequency : MIN_FREQ_HZ;
-    target_freq = frequency;
+
+    if(target_freq != frequency) xEventGroupSetBits(mqtt_dirty_flags,MQTT_UPDATE_TARGT_BIT);
+    target_freq = frequency;    
 }
 
 
