@@ -241,15 +241,17 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 if (strlen(listen_topics[i].topic) == event->topic_len &&
                     strncmp(event->topic, listen_topics[i].topic, event->topic_len) == 0) {
                     
+                    if(!listen_topics[i].handler)
+                    {
+                        ESP_LOGE(TAG, "Topic match found but Handler is NULL!");
+                        break;
+                    }
+
                     // Execute the associated handler
                     listen_topics[i].handler(event->data, event->data_len);
                     handled = true;
-                    
+                    break; 
                 }
-                else {
-                    ESP_LOGE(TAG, "Topic match found but Handler is NULL!");
-                }
-                break; 
             }
             
             if (!handled) {
@@ -347,7 +349,10 @@ void mqtt_init(void)
         .credentials.username = MQTT_USER,
         .credentials.authentication.password = MQTT_PASS,
 
-        .broker.verification.certificate = server_cert_pem,
+        .broker.verification.certificate = CACERTPEM,
+        //#ifdef MQTT_USE_TLS
+        //.broker.verification.certificate_len = strlen(CACERTPEM),
+        //#endif
         .broker.verification.skip_cert_common_name_check = true,
         
     };

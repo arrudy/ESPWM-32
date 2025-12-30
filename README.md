@@ -20,8 +20,8 @@ The device exposes a structured topic tree for controlling inverter operation an
 | Inverter driver (SPWM generation) | 🟡 Implemented – *staging / not fully tested* |
 | MQTT communication                | 🟡 In progress                                |
 | Manual frequency control          | 🟡 Partial                                    |
-| Status manipulation via MQTT      | 🟡 Partial                                    |
-| Status reporting via MQTT         | 🟡 In progress                                |
+| Status manipulation via MQTT      | 🟡 Implemented – *staging / not fully tested* |
+| Status reporting via MQTT         | 🟡 Implemented - *staging / not fully tested* |
 | Fuzzy logic auto-frequency mode   | 🔴 Not implemented                            |
 | Silent mode                       | 🔴 Not implemented                            |
 | Electrical protection logic       | 🔴 Not implemented                            |
@@ -88,14 +88,98 @@ No external libraries required.
 
 ## 🔐 Required Configuration
 
-> ⚠️ **TODO**
+Before building and flashing the firmware, you must create and configure a file named
+`credentials.h` in the project src dir (./main directory, where the rest of the sources are located).
 
-This section will describe required configuration options such as:
+This file contains all network and broker credentials and is **not** tracked in version control.
 
-* Wi-Fi credentials
-* MQTT broker address and credentials
-* Device ID mapping
-* PWM pin assignments
+---
+
+### 1️⃣ Create `credentials.h`
+
+Copy the template below and replace the placeholder values with your real credentials.
+
+```c
+#ifndef CREDENTIALS_H
+#define CREDENTIALS_H
+
+#define WIFI_SSID      "your_wifi_ssid"
+#define WIFI_PASS      "your_wifi_password"
+
+#define MQTT_BROKER_URI "your.broker.ip.address"
+#define MQTT_USER "your_mqtt_user"
+#define MQTT_PASS "your_mqtt_password"
+
+//#define MQTT_USE_TLS
+
+#ifdef MQTT_USE_TLS
+  #define MQTT_PORT    8883
+  #define MQTT_SCHEME  "mqtts"
+
+  #define STRICT
+  #ifdef STRICT // strict certificate policy
+    #define CACERTPEM \
+"-----BEGIN CERTIFICATE-----\n\
+PUT_YOUR_CA_CERTIFICATE_HERE\n\
+-----END CERTIFICATE-----\n"
+
+  #else
+      // --- PERMISSIVE MODE ---
+      // Encrypted, but skips certificate validation.
+      #define MQTT_SKIP_CERT_CHECK
+      static const char *server_cert_pem = NULL; 
+  #endif
+#else
+  #define MQTT_PORT       1883
+  #define MQTT_SCHEME     "mqtt"   // Plain TCP scheme
+  static const char *server_cert_pem = NULL;
+#endif
+
+#endif
+```
+
+---
+
+### 2️⃣ TLS / Non-TLS configuration
+
+By default the firmware uses **unencrypted MQTT (port 1883)**.
+
+To enable **TLS encryption**:
+
+1. Uncomment this line:
+
+   ```c
+   #define MQTT_USE_TLS
+   ```
+2. Paste your broker CA certificate into `CACERTPEM`.
+
+**Modes**
+
+| Mode       | Behavior                                                        |
+| ---------- | --------------------------------------------------------------- |
+| `STRICT`   | Full certificate validation                                     |
+| Permissive | Encrypted but skips certificate verification (requires kconfig changes) |
+
+---
+
+### 3️⃣ PWM Pin Assignments
+
+Default PWM pin mapping, as well as the rest of inverter config, is located in `driver.c`:
+
+```c
+#define SPWM_LEG1_LOW_PIN       12
+#define SPWM_LEG1_HIGH_PIN      13
+#define SPWM_LEG2_LOW_PIN       14
+#define SPWM_LEG2_HIGH_PIN      27
+```
+
+⚠️ **Important:**
+Most of these GPIOs (12, 13, 14) are also used by the ESP32 JTAG interface.
+If you plan to use hardware debugging, you may need to reassign these pins to avoid conflicts.
+
+---
+
+Once `credentials.h` is created and your pin mapping is verified, the firmware is ready to build and flash.
 
 ---
 
