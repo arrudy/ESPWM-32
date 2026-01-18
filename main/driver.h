@@ -5,7 +5,7 @@
 #include "freertos/task.h"
 
 
-#define MIN_FREQ_HZ             20
+#define MIN_FREQ_HZ             30
 #define MAX_FREQ_HZ             60
 #define DEFAULT_FREQ_HZ         50
 #define NOMINAL_FREQ_HZ         ((float)DEFAULT_FREQ_HZ)

@@ -134,6 +134,7 @@ void wifi_init(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
 
     xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
     ESP_LOGI(TAG, "WiFi init done");
@@ -190,6 +191,53 @@ static const mqtt_topic_map_t listen_topics[] = {
 #define LISTEN_TOPICS_COUNT (sizeof(listen_topics) / sizeof(listen_topics[0]))
 
 
+/* ================== HA AUTO DISCOVERY ================== */
+static void publish_ha_discovery(esp_mqtt_client_handle_t client)
+{
+    // 1. Configure the Power Switch
+    // Topic: homeassistant/switch/<device_id>/power/config
+    const char *switch_config = 
+        "{"
+        "\"name\": \"Inverter Power\"," 
+        "\"uniq_id\": \"" DEVICE_ID "_pwr\","
+        "\"cmd_t\": \"home/inverter/" DEVICE_ID "/control/state\","
+        "\"stat_t\": \"home/inverter/" DEVICE_ID "/status/state\","
+        "\"pl_on\": \"ON\","
+        "\"pl_off\": \"OFF\","
+        "\"dev\": {"
+            "\"ids\": [\"" DEVICE_ID "\"],"
+            "\"name\": \"Inverter " DEVICE_ID "\","
+            "\"mdl\": \"ESP32-SPWM\","
+            "\"mf\": \"Custom\""
+        "}"
+        "}";
+
+    esp_mqtt_client_publish(client, 
+        "homeassistant/switch/" DEVICE_ID "/power/config", 
+        switch_config, 0, 1, 1); // Retained = 1
+
+    // 2. Configure the Frequency Slider (Number)
+    // Topic: homeassistant/number/<device_id>/frequency/config
+    const char *freq_config = 
+        "{"
+        "\"name\": \"Target Frequency\"," 
+        "\"uniq_id\": \"" DEVICE_ID "_hz\","
+        "\"cmd_t\": \"home/inverter/" DEVICE_ID "/control/frequency\","
+        "\"stat_t\": \"home/inverter/" DEVICE_ID "/status/frequency\","
+        "\"min\": 30,"
+        "\"max\": 60," // Adjust max frequency as needed
+        "\"unit_of_meas\": \"Hz\","
+        "\"dev\": {\"ids\": [\"" DEVICE_ID "\"]}"
+        "}";
+
+    esp_mqtt_client_publish(client, 
+        "homeassistant/number/" DEVICE_ID "/frequency/config", 
+        freq_config, 0, 1, 1); // Retained = 1
+        
+    ESP_LOGI(TAG, "Sent Home Assistant Auto Discovery payloads");
+}
+
+
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
@@ -201,6 +249,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         case MQTT_EVENT_CONNECTED:
             ESP_LOGI(TAG, "MQTT Connected to %s", MQTT_FULL_URI);
             ESP_LOGI(TAG, "Session present: %d", event->session_present);
+
+            publish_ha_discovery(client);
             
             // Loop through the array and subscribe to everything
             for (int i = 0; i < LISTEN_TOPICS_COUNT; i++) {

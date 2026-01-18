@@ -254,17 +254,13 @@ static bool IRAM_ATTR mcpwm_timer_event_cb(mcpwm_timer_handle_t timer, const mcp
             g_update_pending = false;
         }
         
+    }
 
-
-        if(active_state.enabled == false)
-        {
-            mcpwm_comparator_set_compare_value(comparator_leg1, 0);
-            mcpwm_comparator_set_compare_value(comparator_leg2, 0);
-            return false; 
-        }
-
-
-        
+    if(active_state.enabled == false)
+    {
+        mcpwm_comparator_set_compare_value(comparator_leg1, 0);
+        mcpwm_comparator_set_compare_value(comparator_leg2, 0);
+        return false; 
     }
 
     // 2. Update HF SPWM (Leg 1)
@@ -440,7 +436,7 @@ void setup_mcpwm()
     mcpwm_generator_set_force_level(gen_leg2_h, 0, true);
     mcpwm_generator_set_force_level(gen_leg2_l, 0, true);
     
-    xTaskCreate(freq_update_task, "freq_task", 4096, NULL, 5, NULL);
+    xTaskCreatePinnedToCore(freq_update_task, "freq_task", 4096, NULL, 5, NULL, 1);
 }
 
 
