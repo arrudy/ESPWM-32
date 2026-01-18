@@ -24,7 +24,6 @@ The device exposes a structured topic tree for controlling inverter operation an
 | Status reporting via MQTT         | 🟡 Implemented - *staging / not fully tested* |
 | Fuzzy logic auto-frequency mode   | 🔴 Not implemented                            |
 | Silent mode                       | 🔴 Not implemented                            |
-| Electrical protection logic       | 🔴 Not implemented                            |
 
 ---
 
