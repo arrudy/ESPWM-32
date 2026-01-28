@@ -399,7 +399,7 @@ void setup_mcpwm()
     // -------------------------------------------------------
     // 6. Dead Time Setup (Applied to both legs)
     // -------------------------------------------------------
-    uint32_t dt_ticks = (uint32_t)( (uint64_t)(DEAD_TIME_NS * TIMER_RESOLUTION_HZ) / 1000000000UL);
+    uint32_t dt_ticks = (uint32_t)( ((uint64_t)DEAD_TIME_NS * TIMER_RESOLUTION_HZ) / 1000000000UL);
     
     // -- LEG 1 DEAD TIME --
     // High side: standard delay
