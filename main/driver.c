@@ -256,6 +256,11 @@ static bool IRAM_ATTR mcpwm_timer_event_cb(mcpwm_timer_handle_t timer, const mcp
         
     }
 
+    // 3. Update LF Commutation (Leg 2) via Hardware Force
+    // We only issue the command twice per cycle to save overhead
+    int half_cycle = active_state.samples / 2;
+
+
     if(active_state.enabled == false)
     {
         mcpwm_comparator_set_compare_value(comparator_leg1, 0);
@@ -264,14 +269,21 @@ static bool IRAM_ATTR mcpwm_timer_event_cb(mcpwm_timer_handle_t timer, const mcp
     }
 
     // 2. Update HF SPWM (Leg 1)
-    uint32_t cmp_val = active_lut[g_current_sample_idx];
+
+    uint32_t cmp_val;
+    if(g_current_sample_idx < half_cycle)
+    {
+        cmp_val = active_lut[(g_current_sample_idx+half_cycle/2)%active_state.samples];
+    }
+    else
+    {
+        cmp_val = active_lut[g_current_sample_idx];
+    }
+    
     if (cmp_val > MAX_TICKS) cmp_val = MAX_TICKS; // Safety Clamp
     mcpwm_comparator_set_compare_value(comparator_leg1, cmp_val);
 
 
-    // 3. Update LF Commutation (Leg 2) via Hardware Force
-    // We only issue the command twice per cycle to save overhead
-    int half_cycle = active_state.samples / 2;
 
     if (g_current_sample_idx == 0) {
         // First Half: Leg 2 High=ON, Leg 2 Low=OFF

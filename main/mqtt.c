@@ -399,7 +399,9 @@ void mqtt_init(void)
         .credentials.username = MQTT_USER,
         .credentials.authentication.password = MQTT_PASS,
 
+        #ifdef MQTT_USE_TLS
         .broker.verification.certificate = CACERTPEM,
+        #endif
         //#ifdef MQTT_USE_TLS
         //.broker.verification.certificate_len = strlen(CACERTPEM),
         //#endif
