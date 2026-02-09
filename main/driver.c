@@ -37,7 +37,7 @@ typedef struct {
 #define SPWM_LEG2_HIGH_PIN      27
 
 #define CARRIER_FREQ_HZ         20000UL   // 20kHz
-#define DEAD_TIME_NS            800UL     // 500ns Deadtime
+#define DEAD_TIME_NS            700UL     // 500ns Deadtime
 
 
 
@@ -51,7 +51,7 @@ static const char *TAG = "SPWM";
 #define PEAK_TICKS (TIMER_RESOLUTION_HZ / (CARRIER_FREQ_HZ * 2))
 #define MAX_TICKS ((uint32_t)(PEAK_TICKS*0.95f))
 
-
+#define DEAD_TIME_TICKS   ((uint32_t)((uint64_t)DEAD_TIME_NS * TIMER_RESOLUTION_HZ / 1000000000UL))
 
 
 static DRAM_ATTR uint32_t sine_lut[2][MAX_SAMPLES];
@@ -273,14 +273,16 @@ static bool IRAM_ATTR mcpwm_timer_event_cb(mcpwm_timer_handle_t timer, const mcp
     uint32_t cmp_val;
     if(g_current_sample_idx < half_cycle)
     {
-        cmp_val = active_lut[(g_current_sample_idx+half_cycle/2)%active_state.samples];
+        cmp_val = active_lut[(g_current_sample_idx+half_cycle/2)%active_state.samples] + (DEAD_TIME_NS/100*2);
+        if (cmp_val > PEAK_TICKS ) cmp_val = PEAK_TICKS; // Safety Clamp
     }
     else
     {
-        cmp_val = active_lut[g_current_sample_idx];
+        cmp_val = active_lut[g_current_sample_idx] ;
+        if (cmp_val >  MAX_TICKS) cmp_val = MAX_TICKS; // Safety Clamp
     }
     
-    if (cmp_val > MAX_TICKS) cmp_val = MAX_TICKS; // Safety Clamp
+    
     mcpwm_comparator_set_compare_value(comparator_leg1, cmp_val);
 
 
@@ -411,7 +413,7 @@ void setup_mcpwm()
     // -------------------------------------------------------
     // 6. Dead Time Setup (Applied to both legs)
     // -------------------------------------------------------
-    uint32_t dt_ticks = (uint32_t)( ((uint64_t)DEAD_TIME_NS * TIMER_RESOLUTION_HZ) / 1000000000UL);
+    uint32_t dt_ticks = DEAD_TIME_TICKS;
     
     // -- LEG 1 DEAD TIME --
     // High side: standard delay
